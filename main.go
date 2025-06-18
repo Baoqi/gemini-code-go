@@ -26,6 +26,9 @@ var (
 	geminiAPIKey  = os.Getenv("GEMINI_API_KEY")
 	geminiBaseURL = getEnv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
 
+	// Whether to log /v1/messages request body (controlled via env)
+	logMessagesBody = getEnv("LOG_MESSAGES_BODY", "") != ""
+
 	// Global backoff & retry configuration
 	backoffMutex sync.Mutex
 	backoffUntil time.Time
@@ -390,13 +393,28 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req MessagesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
+
+	if logMessagesBody {
+		// Read body for logging and decoding
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		log.Printf("[REQ_BODY] /v1/messages: %s", string(bodyBytes))
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Decode directly without extra copy
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
 	}
 
 	geminiModel := mapRequestedModel(req.Model)
-
 	logRequest(r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
 
 	gReq, err := convertToGemini(&req, geminiModel)
