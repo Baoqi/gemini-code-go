@@ -20,7 +20,7 @@ import (
 
 var (
 	// Defaults specified by user rules
-	defaultBigModel   = getEnv("BIG_MODEL", "gemini-2.5-flash-preview-05-20")
+	defaultBigModel   = getEnv("BIG_MODEL", "gemini-2.5-flash")
 	defaultSmallModel = getEnv("SMALL_MODEL", "gemini-2.0-flash")
 
 	geminiAPIKey  = os.Getenv("GEMINI_API_KEY")
@@ -28,6 +28,8 @@ var (
 
 	// Whether to log /v1/messages request body (controlled via env)
 	logMessagesBody = getEnv("LOG_MESSAGES_BODY", "") != ""
+	// Whether to log /v1/messages request headers (controlled via env)
+	logMessagesHeaders = getEnv("LOG_MESSAGES_HEADERS", "") != ""
 
 	// Global backoff & retry configuration
 	backoffMutex sync.Mutex
@@ -393,6 +395,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req MessagesRequest
+
+	// Optionally log request headers
+	if logMessagesHeaders {
+		hdr, _ := json.Marshal(r.Header)
+		log.Printf("[REQ_HEADERS] /v1/messages: %s", string(hdr))
+	}
 
 	if logMessagesBody {
 		// Read body for logging and decoding
