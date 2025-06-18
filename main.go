@@ -36,6 +36,8 @@ var (
 	rateLimitMaxRetries       = getEnvInt("GEMINI_RATE_LIMIT_MAX_RETRIES", 2)
 )
 
+const defaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+
 func init() {
 	if geminiAPIKey == "" {
 		log.Println("[WARN] GEMINI_API_KEY not set – the server will start but upstream calls will fail.")
@@ -185,7 +187,7 @@ func convertToGemini(req *MessagesRequest, geminiModel string) (*GenerationReque
 		switch v := m.Content.(type) {
 		case string:
 			contents = append(contents, Content{
-				Role:  m.Role,
+				Role:  mapRole(m.Role),
 				Parts: []Part{{Text: v}},
 			})
 		case []interface{}:
@@ -196,11 +198,11 @@ func convertToGemini(req *MessagesRequest, geminiModel string) (*GenerationReque
 				b, _ := json.Marshal(part)
 				combined.Write(b)
 			}
-			contents = append(contents, Content{Role: m.Role, Parts: []Part{{Text: combined.String()}}})
+			contents = append(contents, Content{Role: mapRole(m.Role), Parts: []Part{{Text: combined.String()}}})
 		default:
 			// Attempt to stringify
 			b, _ := json.Marshal(v)
-			contents = append(contents, Content{Role: m.Role, Parts: []Part{{Text: string(b)}}})
+			contents = append(contents, Content{Role: mapRole(m.Role), Parts: []Part{{Text: string(b)}}})
 		}
 	}
 
@@ -395,6 +397,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	geminiModel := mapRequestedModel(req.Model)
 
+	logRequest(r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
+
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -477,6 +481,8 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	geminiModel := mapRequestedModel(req.Model)
 
+	logRequest(r.URL.Path, geminiModel, 0, len(req.Messages))
+
 	// Prepare upstream request
 	contents := make([]Content, 0, len(req.Messages))
 	for _, m := range req.Messages {
@@ -532,6 +538,9 @@ func main() {
 	mux.HandleFunc("/v1/messages/count_tokens", handleCountTokens)
 
 	addr := getEnv("PORT", "8082")
+	if geminiBaseURL != defaultGeminiBaseURL {
+		log.Printf("[INFO] GEMINI_BASE_URL=%s", geminiBaseURL)
+	}
 	log.Printf("[INFO] Starting server on :%s (Big=%s Small=%s)\n", addr, defaultBigModel, defaultSmallModel)
 	if err := http.ListenAndServe(":"+addr, mux); err != nil {
 		log.Fatalf("server error: %v", err)
@@ -695,4 +704,16 @@ func handleGeminiStreamToAnthropic(w http.ResponseWriter, body io.ReadCloser) {
 	// stream ended without explicit finish
 	writeSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": 0})
 	writeSSE(w, "message_stop", map[string]interface{}{"type": "message_stop"})
+}
+
+// logRequest prints path, model used, tools/messages counts.
+func logRequest(path, model string, tools, messages int) {
+	log.Printf("[REQ] %s -> %s (%d tools, %d messages)", path, model, tools, messages)
+}
+
+func mapRole(r string) string {
+	if r == "user" {
+		return "user"
+	}
+	return "model"
 }
