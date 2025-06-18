@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,9 @@ var (
 	internalErrorMaxRetries   = getEnvInt("GEMINI_INTERNAL_ERROR_MAX_RETRIES", 2)
 	rateLimitDefaultDelay     = getEnvDuration("GEMINI_RATE_LIMIT_DEFAULT_DELAY", 60*time.Second)
 	rateLimitMaxRetries       = getEnvInt("GEMINI_RATE_LIMIT_MAX_RETRIES", 2)
+
+	// Atomic counter for incoming requests – used to correlate logs.
+	reqIDCounter uint64
 )
 
 const defaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
@@ -422,8 +426,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Allocate unique request ID for log correlation
+	reqID := nextRequestID()
+	start := time.Now()
 	geminiModel := mapRequestedModel(req.Model)
-	logRequest(r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
+	logRequest(reqID, r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
 
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
@@ -431,7 +438,6 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start := time.Now()
 	resp, err := performGeminiRequestWithRetry(geminiModel, gReq, req.Stream)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
@@ -445,7 +451,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		handleGeminiStreamToAnthropic(w, resp.Body)
-		log.Printf("[INFO] Stream completed in %.2fs", time.Since(start).Seconds())
+		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
 		return
 	}
 
@@ -491,7 +497,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		Content: blocks,
 	}
 	respondJSON(w, result)
-	log.Printf("[INFO] Completed in %.2fs", time.Since(start).Seconds())
+	log.Printf("[INFO][%d] Completed in %.2fs", reqID, time.Since(start).Seconds())
 }
 
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
@@ -505,9 +511,12 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Allocate unique request ID for log correlation
+	reqID := nextRequestID()
+	start := time.Now()
 	geminiModel := mapRequestedModel(req.Model)
 
-	logRequest(r.URL.Path, geminiModel, 0, len(req.Messages))
+	logRequest(reqID, r.URL.Path, geminiModel, 0, len(req.Messages))
 
 	// Prepare upstream request
 	contents := make([]Content, 0, len(req.Messages))
@@ -544,6 +553,7 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, TokenCountResponse{InputTokens: upstreamResp.TotalTokens})
+	log.Printf("[INFO][%d] Token count completed in %.2fs", reqID, time.Since(start).Seconds())
 }
 
 // respondJSON writes JSON with proper headers.
@@ -733,8 +743,8 @@ func handleGeminiStreamToAnthropic(w http.ResponseWriter, body io.ReadCloser) {
 }
 
 // logRequest prints path, model used, tools/messages counts.
-func logRequest(path, model string, tools, messages int) {
-	log.Printf("[REQ] %s -> %s (%d tools, %d messages)", path, model, tools, messages)
+func logRequest(id uint64, path, model string, tools, messages int) {
+	log.Printf("[REQ][%d] %s -> %s (%d tools, %d messages)", id, path, model, tools, messages)
 }
 
 func mapRole(r string) string {
@@ -742,4 +752,9 @@ func mapRole(r string) string {
 		return "user"
 	}
 	return "model"
+}
+
+// nextRequestID atomically increments and returns the next request identifier.
+func nextRequestID() uint64 {
+	return atomic.AddUint64(&reqIDCounter, 1)
 }
