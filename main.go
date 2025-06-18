@@ -450,7 +450,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		handleGeminiStreamToAnthropic(w, resp.Body)
+		handleGeminiStreamToAnthropic(reqID, w, resp.Body)
 		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
 		return
 	}
@@ -475,6 +475,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 					"text": p.Text,
 				})
 			} else if p.FunctionCall != nil {
+				log.Printf("[TOOL][%d] %s %s", reqID, p.FunctionCall.Name, summarizeArgs(p.FunctionCall.Name, p.FunctionCall.Args))
 				// parse args JSON into map[string]interface{}
 				var argsMap map[string]interface{}
 				if err := json.Unmarshal(p.FunctionCall.Args, &argsMap); err != nil {
@@ -668,7 +669,7 @@ func writeSSE(w http.ResponseWriter, event string, data interface{}) {
 }
 
 // handleGeminiStreamToAnthropic converts Gemini streaming JSON chunks to Anthropic SSE format.
-func handleGeminiStreamToAnthropic(w http.ResponseWriter, body io.ReadCloser) {
+func handleGeminiStreamToAnthropic(reqID uint64, w http.ResponseWriter, body io.ReadCloser) {
 	defer body.Close()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
@@ -714,6 +715,17 @@ func handleGeminiStreamToAnthropic(w http.ResponseWriter, body io.ReadCloser) {
 				"index": 0,
 				"delta": map[string]string{"text": part.Text},
 			})
+		} else if part.FunctionCall != nil {
+			// Log tool invocation
+			log.Printf("[TOOL][%d] %s %s", reqID, part.FunctionCall.Name, summarizeArgs(part.FunctionCall.Name, part.FunctionCall.Args))
+			// Forward as tool_use block delta if desired (not mandatory for logging)
+			writeSSE(w, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]interface{}{ // minimal
+					"tool_call": part.FunctionCall.Name,
+				},
+			})
 		}
 
 		// Check for finish
@@ -757,4 +769,34 @@ func mapRole(r string) string {
 // nextRequestID atomically increments and returns the next request identifier.
 func nextRequestID() uint64 {
 	return atomic.AddUint64(&reqIDCounter, 1)
+}
+
+// summarizeArgs produces a concise string representation of tool arguments for logging.
+func summarizeArgs(name string, raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var generic interface{}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return ""
+	}
+
+	// Special-case bash tool – show full command.
+	m, isMap := generic.(map[string]interface{})
+	if isMap {
+		lname := strings.ToLower(name)
+		if lname == "bash" || strings.Contains(lname, "bash") {
+			if cmd, ok := m["command"]; ok {
+				return fmt.Sprintf("\"%v\"", cmd)
+			}
+		}
+	}
+
+	// Fallback: marshal compact and truncate if long.
+	b, _ := json.Marshal(generic)
+	s := string(b)
+	if len(s) > 120 {
+		s = s[:117] + "..."
+	}
+	return s
 }
