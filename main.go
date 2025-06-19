@@ -644,7 +644,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	spanID := lfStartSpan(session.TraceID, spanName, spanInput)
 
 	log.Printf("[SESSION] Req[%d] in session %s (span: %s, new: %v)",
-		reqID, session.TraceID[:8], spanID[:8], isNewSession)
+		reqID, safeStringPrefix(session.TraceID, 8), safeStringPrefix(spanID, 8), isNewSession)
 
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
@@ -1087,6 +1087,18 @@ func mapRole(r string) string {
 // nextRequestID atomically increments and returns the next request identifier.
 func nextRequestID() uint64 {
 	return atomic.AddUint64(&reqIDCounter, 1)
+}
+
+// safeStringPrefix safely returns the first n characters of a string,
+// returning the whole string if it's shorter than n, or "n/a" if empty
+func safeStringPrefix(s string, n int) string {
+	if s == "" {
+		return "n/a"
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // summarizeArgs produces a concise string representation of tool arguments for logging.
