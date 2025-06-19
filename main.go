@@ -35,6 +35,8 @@ var (
 	logMessagesHeaders = getEnv("LOG_MESSAGES_HEADERS", "") != ""
 	// Whether to log full raw output in Langfuse (controlled via env)
 	logFullOutput = getEnv("LOG_FULL_OUTPUT", "") != ""
+	// Whether to skip recording output for streaming requests (controlled via env, default enabled)
+	skipStreamOutput = getEnv("SKIP_STREAM_OUTPUT", "1") != "0"
 
 	// Global backoff & retry configuration
 	backoffMutex sync.Mutex
@@ -652,11 +654,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upStart := time.Now()
-	generationID := lfStartGeneration(session.TraceID, "gemini_generate", geminiModel, gReq, spanID)
+	var generationID string
+
+	// Only start generation tracking if not skipping stream output or not streaming
+	if !req.Stream || !skipStreamOutput {
+		generationID = lfStartGeneration(session.TraceID, "gemini_generate", geminiModel, gReq, spanID)
+	}
 
 	resp, err := performGeminiRequestWithRetry(geminiModel, gReq, req.Stream)
 	if err != nil {
-		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{"error": err.Error()})
+		if generationID != "" {
+			lfFinishGeneration(generationID, nil, nil, map[string]interface{}{"error": err.Error()})
+		}
 		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()}, map[string]interface{}{"error": err.Error()})
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		return
@@ -672,25 +681,32 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// For streaming, we just handle normally and note it in output
 		handleGeminiStreamToAnthropic(reqID, w, resp.Body)
 
-		// Finish generation after stream completes
-		latencyMs := time.Since(upStart).Milliseconds()
+		// Only finish generation if we started one
+		if generationID != "" {
+			latencyMs := time.Since(upStart).Milliseconds()
+			generationOutput := map[string]interface{}{
+				"stream": true,
+				"status": resp.StatusCode,
+				"note":   "Stream content processed in real-time",
+			}
 
-		// Prepare generation output for streaming
-		generationOutput := map[string]interface{}{
-			"stream": true,
-			"status": resp.StatusCode,
-			"note":   "Stream content processed in real-time",
+			lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
+				"status":     resp.StatusCode,
+				"latency_ms": latencyMs,
+				"model":      geminiModel,
+				"stream":     true,
+			})
 		}
 
-		lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
-			"status":     resp.StatusCode,
-			"latency_ms": latencyMs,
-			"model":      geminiModel,
-			"stream":     true,
-		})
-
 		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
-		lfFinishSpan(spanID, "stream completed", map[string]interface{}{
+
+		// For streaming spans, optionally skip output recording
+		var spanOutput interface{} = "stream completed"
+		if skipStreamOutput {
+			spanOutput = nil
+		}
+
+		lfFinishSpan(spanID, spanOutput, map[string]interface{}{
 			"stream_completed": true,
 			"duration_ms":      time.Since(start).Milliseconds(),
 		})
