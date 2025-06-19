@@ -627,25 +627,35 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		spanName = fmt.Sprintf("query: %s", userQuery)
 	}
 
-	spanID := lfStartSpan(session.TraceID, spanName)
+	// Prepare span input (user request)
+	spanInput := map[string]interface{}{
+		"model":      req.Model,
+		"max_tokens": req.MaxTokens,
+		"messages":   req.Messages,
+	}
+	if len(req.Tools) > 0 {
+		spanInput["tools"] = len(req.Tools)
+	}
+
+	spanID := lfStartSpan(session.TraceID, spanName, spanInput)
 
 	log.Printf("[SESSION] Req[%d] in session %s (span: %s, new: %v)",
 		reqID, session.TraceID[:8], spanID[:8], isNewSession)
 
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
-		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()})
+		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()}, map[string]interface{}{"error": err.Error()})
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	upStart := time.Now()
-	generationID := lfStartGeneration(session.TraceID, "gemini_generate", geminiModel, gReq)
+	generationID := lfStartGeneration(session.TraceID, "gemini_generate", geminiModel, gReq, spanID)
 
 	resp, err := performGeminiRequestWithRetry(geminiModel, gReq, req.Stream)
 	if err != nil {
 		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{"error": err.Error()})
-		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()})
+		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()}, map[string]interface{}{"error": err.Error()})
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -668,7 +678,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		})
 
 		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
-		lfFinishSpan(spanID, map[string]interface{}{
+		lfFinishSpan(spanID, "stream completed", map[string]interface{}{
 			"stream_completed": true,
 			"duration_ms":      time.Since(start).Milliseconds(),
 		})
@@ -685,7 +695,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		} `json:"candidates"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
-		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)})
+		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)}, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)})
 		http.Error(w, "failed to decode upstream", http.StatusBadGateway)
 		return
 	}
@@ -755,7 +765,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	lfFinishSpan(spanID, spanMetadata)
+	lfFinishSpan(spanID, result, spanMetadata)
 }
 
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {

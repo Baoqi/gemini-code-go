@@ -345,7 +345,7 @@ func lfFinishTrace(traceID string, output interface{}, err error) {
 }
 
 // lfStartSpan creates and records a new span
-func lfStartSpan(traceID, name string) string {
+func lfStartSpan(traceID, name string, input interface{}) string {
 	if !lfEnabled || traceID == "" {
 		return ""
 	}
@@ -357,6 +357,7 @@ func lfStartSpan(traceID, name string) string {
 		ID:          spanID,
 		TraceID:     traceID,
 		Name:        name,
+		Input:       input,
 		StartTime:   now,
 		Level:       "DEFAULT",
 		Environment: getEnv("LANGFUSE_ENVIRONMENT", "production"),
@@ -374,8 +375,8 @@ func lfStartSpan(traceID, name string) string {
 	return spanID
 }
 
-// lfFinishSpan updates a span with metadata and end time
-func lfFinishSpan(spanID string, metadata map[string]interface{}) {
+// lfFinishSpan updates a span with output and end time
+func lfFinishSpan(spanID string, output interface{}, metadata map[string]interface{}) {
 	if !lfEnabled || spanID == "" {
 		return
 	}
@@ -392,6 +393,7 @@ func lfFinishSpan(spanID string, metadata map[string]interface{}) {
 	body := SpanBody{
 		ID:          spanID,
 		TraceID:     traceID,
+		Output:      output,
 		EndTime:     now,
 		Metadata:    metadata,
 		Environment: getEnv("LANGFUSE_ENVIRONMENT", "production"),
@@ -408,8 +410,8 @@ func lfFinishSpan(spanID string, metadata map[string]interface{}) {
 	lfSpanTrace.Delete(spanID)
 }
 
-// lfStartGeneration creates and records a new generation
-func lfStartGeneration(traceID, name, model string, input interface{}) string {
+// lfStartGeneration creates and records a new generation as child of a span
+func lfStartGeneration(traceID, name, model string, input interface{}, parentSpanID string) string {
 	if !lfEnabled || traceID == "" {
 		return ""
 	}
@@ -418,14 +420,15 @@ func lfStartGeneration(traceID, name, model string, input interface{}) string {
 	now := time.Now().UTC().Format(lfTimeFmt)
 
 	body := GenerationBody{
-		ID:          generationID,
-		TraceID:     traceID,
-		Name:        name,
-		Model:       model,
-		Input:       input,
-		StartTime:   now,
-		Level:       "DEFAULT",
-		Environment: getEnv("LANGFUSE_ENVIRONMENT", "production"),
+		ID:                  generationID,
+		TraceID:             traceID,
+		ParentObservationID: parentSpanID, // Set parent relationship
+		Name:                name,
+		Model:               model,
+		Input:               input,
+		StartTime:           now,
+		Level:               "DEFAULT",
+		Environment:         getEnv("LANGFUSE_ENVIRONMENT", "production"),
 	}
 
 	lfPush(lfEvent{
