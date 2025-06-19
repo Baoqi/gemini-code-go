@@ -33,6 +33,8 @@ var (
 	logMessagesBody = getEnv("LOG_MESSAGES_BODY", "") != ""
 	// Whether to log /v1/messages request headers (controlled via env)
 	logMessagesHeaders = getEnv("LOG_MESSAGES_HEADERS", "") != ""
+	// Whether to log full raw output in Langfuse (controlled via env)
+	logFullOutput = getEnv("LOG_FULL_OUTPUT", "") != ""
 
 	// Global backoff & retry configuration
 	backoffMutex sync.Mutex
@@ -71,7 +73,7 @@ type SessionManager struct {
 }
 
 func NewSessionManager() *SessionManager {
-	timeout := getEnvDuration("SESSION_TIMEOUT", 5*time.Minute) // 5 minutes default
+	timeout := getEnvDuration("SESSION_TIMEOUT", 10*time.Minute) // 10 minutes default
 	if timeout < time.Minute {
 		timeout = time.Minute // minimum 1 minute
 	}
@@ -101,7 +103,7 @@ func (sm *SessionManager) getSessionKey(r *http.Request) string {
 	// Add timing component for session grouping
 	timeoutSeconds := int64(sm.timeout.Seconds())
 	if timeoutSeconds <= 0 {
-		timeoutSeconds = 300 // fallback to 5 minutes
+		timeoutSeconds = 600 // fallback to 10 minutes
 	}
 	timeWindow := time.Now().Unix() / timeoutSeconds
 	h.Write([]byte(fmt.Sprintf("%d", timeWindow)))
@@ -666,11 +668,21 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+
+		// For streaming, we just handle normally and note it in output
 		handleGeminiStreamToAnthropic(reqID, w, resp.Body)
 
 		// Finish generation after stream completes
 		latencyMs := time.Since(upStart).Milliseconds()
-		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{
+
+		// Prepare generation output for streaming
+		generationOutput := map[string]interface{}{
+			"stream": true,
+			"status": resp.StatusCode,
+			"note":   "Stream content processed in real-time",
+		}
+
+		lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
 			"status":     resp.StatusCode,
 			"latency_ms": latencyMs,
 			"model":      geminiModel,
@@ -689,16 +701,29 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	latencyMs := time.Since(upStart).Milliseconds()
 
 	// Non-streaming – parse upstream JSON and translate to Anthropic blocks
+	// Read the full response body for logging
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("read body: %v", err)}, map[string]interface{}{"error": fmt.Sprintf("read body: %v", err)})
+		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
+		return
+	}
+
+	// Parse the upstream response
 	var upstream struct {
 		Candidates []struct {
 			Content Content `json:"content"`
 		} `json:"candidates"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+	if err := json.Unmarshal(responseBody, &upstream); err != nil {
 		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)}, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)})
 		http.Error(w, "failed to decode upstream", http.StatusBadGateway)
 		return
 	}
+
+	// Store the raw upstream response for generation output
+	var rawUpstreamResponse interface{}
+	json.Unmarshal(responseBody, &rawUpstreamResponse)
 
 	var blocks []interface{}
 	if len(upstream.Candidates) > 0 {
@@ -732,8 +757,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		Content: blocks,
 	}
 
-	// Update generation with final output
-	lfFinishGeneration(generationID, result.Content, nil, map[string]interface{}{
+	// Update generation with output - include raw response if enabled
+	generationOutput := map[string]interface{}{
+		"anthropic_format": result.Content,
+		"processed_blocks": len(blocks),
+	}
+
+	// Optionally include full raw Gemini response for debugging
+	if logFullOutput {
+		generationOutput["raw_gemini_response"] = rawUpstreamResponse
+	}
+
+	lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
 		"status":         resp.StatusCode,
 		"latency_ms":     latencyMs,
 		"model":          geminiModel,
