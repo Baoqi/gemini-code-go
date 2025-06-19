@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,7 +45,176 @@ var (
 
 	// Atomic counter for incoming requests – used to correlate logs.
 	reqIDCounter uint64
+
+	// Session management
+	sessionManager *SessionManager
 )
+
+// ----- Session Management -----
+
+type SessionInfo struct {
+	TraceID       string
+	LastActivity  time.Time
+	RequestCount  int
+	TotalMessages int
+	TotalTools    int
+	UserAgent     string
+	ClientInfo    string
+	mutex         sync.RWMutex
+}
+
+type SessionManager struct {
+	sessions    map[string]*SessionInfo
+	mutex       sync.RWMutex
+	timeout     time.Duration
+	cleanupTick *time.Ticker
+}
+
+func NewSessionManager() *SessionManager {
+	timeout := getEnvDuration("SESSION_TIMEOUT", 5*time.Minute) // 5 minutes default
+	if timeout < time.Minute {
+		timeout = time.Minute // minimum 1 minute
+	}
+
+	sm := &SessionManager{
+		sessions: make(map[string]*SessionInfo),
+		timeout:  timeout,
+	}
+
+	// Start cleanup goroutine
+	sm.cleanupTick = time.NewTicker(1 * time.Minute)
+	go sm.cleanupExpiredSessions()
+
+	return sm
+}
+
+func (sm *SessionManager) getSessionKey(r *http.Request) string {
+	// Use API key + User-Agent + client info to create session key
+	apiKey := r.Header.Get("X-Api-Key")
+	userAgent := r.Header.Get("User-Agent")
+
+	// Create a hash for session identification
+	h := sha256.New()
+	h.Write([]byte(apiKey))
+	h.Write([]byte(userAgent))
+
+	// Add timing component for session grouping
+	timeoutSeconds := int64(sm.timeout.Seconds())
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 300 // fallback to 5 minutes
+	}
+	timeWindow := time.Now().Unix() / timeoutSeconds
+	h.Write([]byte(fmt.Sprintf("%d", timeWindow)))
+
+	return hex.EncodeToString(h.Sum(nil))[:16] // Use first 16 chars
+}
+
+func (sm *SessionManager) getOrCreateSession(r *http.Request, model string, toolCount, messageCount int) (*SessionInfo, bool) {
+	sessionKey := sm.getSessionKey(r)
+
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	session, exists := sm.sessions[sessionKey]
+	if !exists {
+		// Create new session
+		userAgent := r.Header.Get("User-Agent")
+		clientInfo := extractClientInfo(r)
+
+		traceID := lfStartTrace("claude_session", map[string]interface{}{
+			"session_key": sessionKey,
+			"user_agent":  userAgent,
+			"client_info": clientInfo,
+			"model":       model,
+			"started_at":  time.Now().UTC().Format(time.RFC3339),
+		})
+
+		session = &SessionInfo{
+			TraceID:       traceID,
+			LastActivity:  time.Now(),
+			RequestCount:  0,
+			TotalMessages: 0,
+			TotalTools:    0,
+			UserAgent:     userAgent,
+			ClientInfo:    clientInfo,
+		}
+		sm.sessions[sessionKey] = session
+
+		log.Printf("[SESSION] New session created: %s (trace: %s)", sessionKey, traceID)
+	}
+
+	// Update session stats
+	session.mutex.Lock()
+	session.LastActivity = time.Now()
+	session.RequestCount++
+	session.TotalMessages += messageCount
+	session.TotalTools += toolCount
+	session.mutex.Unlock()
+
+	return session, !exists
+}
+
+func (sm *SessionManager) cleanupExpiredSessions() {
+	for {
+		select {
+		case <-sm.cleanupTick.C:
+			sm.cleanupExpired()
+		}
+	}
+}
+
+func (sm *SessionManager) cleanupExpired() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	cutoff := time.Now().Add(-sm.timeout - time.Minute) // Add 1 minute buffer
+	var expiredKeys []string
+
+	for key, session := range sm.sessions {
+		session.mutex.RLock()
+		if session.LastActivity.Before(cutoff) {
+			expiredKeys = append(expiredKeys, key)
+
+			// Finish the session trace
+			lfFinishTrace(session.TraceID, map[string]interface{}{
+				"session_completed": true,
+				"total_requests":    session.RequestCount,
+				"total_messages":    session.TotalMessages,
+				"total_tools":       session.TotalTools,
+				"duration_seconds":  time.Since(session.LastActivity.Add(-sm.timeout)).Seconds(),
+			}, nil)
+
+			log.Printf("[SESSION] Session expired: %s (requests: %d)", key, session.RequestCount)
+		}
+		session.mutex.RUnlock()
+	}
+
+	for _, key := range expiredKeys {
+		delete(sm.sessions, key)
+	}
+}
+
+func extractClientInfo(r *http.Request) string {
+	parts := []string{}
+
+	if app := r.Header.Get("X-App"); app != "" {
+		parts = append(parts, "app:"+app)
+	}
+	if version := r.Header.Get("X-Stainless-Package-Version"); version != "" {
+		parts = append(parts, "v:"+version)
+	}
+	if os := r.Header.Get("X-Stainless-Os"); os != "" {
+		parts = append(parts, "os:"+os)
+	}
+	if runtime := r.Header.Get("X-Stainless-Runtime"); runtime != "" {
+		parts = append(parts, "rt:"+runtime)
+	}
+
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, ",")
+}
 
 const defaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -53,6 +224,8 @@ func init() {
 	}
 	// initialize Langfuse if env vars present
 	initLangfuse()
+	// initialize session manager
+	sessionManager = NewSessionManager()
 }
 
 // getEnv returns value from environment or fallback if empty.
@@ -434,28 +607,45 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	geminiModel := mapRequestedModel(req.Model)
 	logRequest(reqID, r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
 
-	// ---- Langfuse trace start ----
-	traceID := lfStartTrace("claude_proxy", map[string]interface{}{
-		"model":    req.Model,
-		"gemini":   geminiModel,
-		"messages": len(req.Messages),
-		"tools":    len(req.Tools),
-	})
+	// ---- Session-based Langfuse trace management ----
+	session, isNewSession := sessionManager.getOrCreateSession(r, geminiModel, len(req.Tools), len(req.Messages))
+
+	// Extract first user message for session context
+	var userQuery string
+	if len(req.Messages) > 0 {
+		if content, ok := req.Messages[0].Content.(string); ok {
+			userQuery = content
+			if len(userQuery) > 100 {
+				userQuery = userQuery[:97] + "..."
+			}
+		}
+	}
+
+	// Create span for this specific request within the session
+	spanName := fmt.Sprintf("request_%d", session.RequestCount)
+	if userQuery != "" && isNewSession {
+		spanName = fmt.Sprintf("query: %s", userQuery)
+	}
+
+	spanID := lfStartSpan(session.TraceID, spanName)
+
+	log.Printf("[SESSION] Req[%d] in session %s (span: %s, new: %v)",
+		reqID, session.TraceID[:8], spanID[:8], isNewSession)
 
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
-		lfFinishTrace(traceID, nil, err)
+		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()})
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	upStart := time.Now()
-	generationID := lfStartGeneration(traceID, "gemini_generate", geminiModel, gReq)
+	generationID := lfStartGeneration(session.TraceID, "gemini_generate", geminiModel, gReq)
 
 	resp, err := performGeminiRequestWithRetry(geminiModel, gReq, req.Stream)
 	if err != nil {
 		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{"error": err.Error()})
-		lfFinishTrace(traceID, nil, err)
+		lfFinishSpan(spanID, map[string]interface{}{"error": err.Error()})
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -478,7 +668,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		})
 
 		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
-		lfFinishTrace(traceID, "stream completed", nil)
+		lfFinishSpan(spanID, map[string]interface{}{
+			"stream_completed": true,
+			"duration_ms":      time.Since(start).Milliseconds(),
+		})
 		return
 	}
 
@@ -492,7 +685,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		} `json:"candidates"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
-		lfFinishTrace(traceID, nil, fmt.Errorf("decode upstream: %v", err))
+		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)})
 		http.Error(w, "failed to decode upstream", http.StatusBadGateway)
 		return
 	}
@@ -541,16 +734,28 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, result)
 	log.Printf("[INFO][%d] Completed in %.2fs", reqID, time.Since(start).Seconds())
 
-	// Finish trace with simple text output for Langfuse dashboard
-	outputText := ""
+	// Finish span with request completion info
+	spanMetadata := map[string]interface{}{
+		"request_completed": true,
+		"duration_ms":       time.Since(start).Milliseconds(),
+		"content_blocks":    len(blocks),
+		"model":             geminiModel,
+	}
+
+	// Add first text output for context
 	if len(blocks) > 0 {
 		if firstBlock, ok := blocks[0].(map[string]interface{}); ok {
 			if text, exists := firstBlock["text"]; exists {
-				outputText = fmt.Sprintf("%v", text)
+				outputText := fmt.Sprintf("%v", text)
+				if len(outputText) > 200 {
+					outputText = outputText[:197] + "..."
+				}
+				spanMetadata["output_preview"] = outputText
 			}
 		}
 	}
-	lfFinishTrace(traceID, outputText, nil)
+
+	lfFinishSpan(spanID, spanMetadata)
 }
 
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
