@@ -161,6 +161,12 @@ var (
 
 // initLangfuse initializes the Langfuse client with environment variables
 func initLangfuse() {
+	// Check if Langfuse is explicitly enabled
+	if getEnv("GEMINI_CODE_ENABLE_LANGFUSE", "") == "" {
+		log.Printf("[LF] Langfuse disabled: GEMINI_CODE_ENABLE_LANGFUSE not set")
+		return
+	}
+
 	pub := os.Getenv("LANGFUSE_PUBLIC_KEY")
 	sec := os.Getenv("LANGFUSE_SECRET_KEY")
 	if pub == "" || sec == "" {
