@@ -33,6 +33,9 @@ var (
 	logMessagesBody = getEnv("LOG_MESSAGES_BODY", "") != ""
 	// Whether to log /v1/messages request headers (controlled via env)
 	logMessagesHeaders = getEnv("LOG_MESSAGES_HEADERS", "") != ""
+	// Whether to log /v1/messages response body and headers
+	logMessagesRespBody    = getEnv("LOG_MESSAGES_RESP_BODY", "") != ""
+	logMessagesRespHeaders = getEnv("LOG_MESSAGES_RESP_HEADERS", "") != ""
 	// Whether to log full raw output in Langfuse (controlled via env)
 	logFullOutput = getEnv("LOG_FULL_OUTPUT", "") != ""
 	// Whether to skip recording output for streaming requests (controlled via env, default enabled)
@@ -320,10 +323,20 @@ type MessagesRequest struct {
 }
 
 type MessagesResponse struct {
-	ID      string      `json:"id"`
-	Model   string      `json:"model"`
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
+	ID           string      `json:"id"`
+	Type         string      `json:"type"`
+	Model        string      `json:"model"`
+	Role         string      `json:"role"`
+	StopReason   string      `json:"stop_reason"`
+	StopSequence interface{} `json:"stop_sequence"`
+	Content      interface{} `json:"content"`
+	Usage        *Usage      `json:"usage,omitempty"`
+}
+
+// Usage holds prompt and completion token counts for this generation.
+type Usage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 // TokenCountRequest mirrors Anthropic route
@@ -679,7 +692,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 		// For streaming, we just handle normally and note it in output
-		handleGeminiStreamToAnthropic(reqID, w, resp.Body)
+		usage := handleGeminiStreamToAnthropic(reqID, w, resp.Body)
 
 		// Only finish generation if we started one
 		if generationID != "" {
@@ -690,11 +703,46 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 				"note":   "Stream content processed in real-time",
 			}
 
-			lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
+			// Convert to Langfuse UsageInfo if available
+			var lfUsageStream *UsageInfo
+			if usage != nil {
+				lfUsageStream = &UsageInfo{
+					Input:            usage.InputTokens,
+					Output:           usage.OutputTokens,
+					Total:            usage.InputTokens + usage.OutputTokens,
+					Unit:             "TOKENS",
+					PromptTokens:     usage.InputTokens,
+					CompletionTokens: usage.OutputTokens,
+				}
+
+				generationOutput["prompt_tokens"] = usage.InputTokens
+				generationOutput["completion_tokens"] = usage.OutputTokens
+				generationOutput["total_tokens"] = usage.InputTokens + usage.OutputTokens
+			}
+
+			lfFinishGeneration(generationID, generationOutput, lfUsageStream, map[string]interface{}{
 				"status":     resp.StatusCode,
 				"latency_ms": latencyMs,
 				"model":      geminiModel,
 				"stream":     true,
+				"prompt_tokens": func() int {
+					if usage != nil {
+						return usage.InputTokens
+					}
+					return 0
+				}(),
+				"completion_tokens": func() int {
+					if usage != nil {
+						return usage.OutputTokens
+					}
+					return 0
+				}(),
+				"total_tokens": func() int {
+					if usage != nil {
+						return usage.InputTokens + usage.OutputTokens
+					}
+					return 0
+				}(),
 			})
 		}
 
@@ -730,6 +778,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		Candidates []struct {
 			Content Content `json:"content"`
 		} `json:"candidates"`
+
+		UsageMetadata struct {
+			PromptTokens     int `json:"promptTokenCount"`
+			CandidatesTokens int `json:"candidatesTokenCount"`
+		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(responseBody, &upstream); err != nil {
 		lfFinishSpan(spanID, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)}, map[string]interface{}{"error": fmt.Sprintf("decode upstream: %v", err)})
@@ -767,10 +820,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := MessagesResponse{
-		ID:      fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		Model:   req.Model,
-		Role:    "assistant",
-		Content: blocks,
+		ID:           fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		Type:         "message",
+		Model:        req.Model,
+		Role:         "assistant",
+		StopReason:   "end_turn",
+		StopSequence: nil,
+		Content:      blocks,
+		Usage: &Usage{
+			InputTokens:  upstream.UsageMetadata.PromptTokens,
+			OutputTokens: upstream.UsageMetadata.CandidatesTokens,
+		},
 	}
 
 	// Update generation with output - include raw response if enabled
@@ -779,18 +839,57 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		"processed_blocks": len(blocks),
 	}
 
+	// Add token usage to generation output if available
+	if result.Usage != nil {
+		generationOutput["prompt_tokens"] = result.Usage.InputTokens
+		generationOutput["completion_tokens"] = result.Usage.OutputTokens
+	}
+
 	// Optionally include full raw Gemini response for debugging
 	if logFullOutput {
 		generationOutput["raw_gemini_response"] = rawUpstreamResponse
 	}
 
-	lfFinishGeneration(generationID, generationOutput, nil, map[string]interface{}{
-		"status":         resp.StatusCode,
-		"latency_ms":     latencyMs,
-		"model":          geminiModel,
-		"response_id":    result.ID,
-		"content_blocks": len(blocks),
+	// Prepare Langfuse usage structure if token info available
+	var lfUsage *UsageInfo
+	if result.Usage != nil {
+		lfUsage = &UsageInfo{
+			Input:            result.Usage.InputTokens,
+			Output:           result.Usage.OutputTokens,
+			Total:            result.Usage.InputTokens + result.Usage.OutputTokens,
+			Unit:             "TOKENS",
+			PromptTokens:     result.Usage.InputTokens,
+			CompletionTokens: result.Usage.OutputTokens,
+		}
+	}
+
+	// Prepare metadata for Langfuse generation update
+	promptTokens := 0
+	completionTokens := 0
+	if result.Usage != nil {
+		promptTokens = result.Usage.InputTokens
+		completionTokens = result.Usage.OutputTokens
+	}
+
+	lfFinishGeneration(generationID, generationOutput, lfUsage, map[string]interface{}{
+		"status":            resp.StatusCode,
+		"latency_ms":        latencyMs,
+		"model":             geminiModel,
+		"response_id":       result.ID,
+		"content_blocks":    len(blocks),
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
 	})
+
+	// Optionally log response headers/body
+	if logMessagesRespHeaders {
+		hdr, _ := json.Marshal(w.Header())
+		log.Printf("[RESP_HEADERS] /v1/messages: %s", string(hdr))
+	}
+	if logMessagesRespBody {
+		rb, _ := json.Marshal(result)
+		log.Printf("[RESP_BODY] /v1/messages: %s", string(rb))
+	}
 
 	respondJSON(w, result)
 	log.Printf("[INFO][%d] Completed in %.2fs", reqID, time.Since(start).Seconds())
@@ -824,6 +923,7 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	log.Printf("[INFO] Counting tokens for %s", r.URL.Path)
 	var req TokenCountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -987,7 +1087,8 @@ func writeSSE(w http.ResponseWriter, event string, data interface{}) {
 }
 
 // handleGeminiStreamToAnthropic converts Gemini streaming JSON chunks to Anthropic SSE format.
-func handleGeminiStreamToAnthropic(reqID uint64, w http.ResponseWriter, body io.ReadCloser) {
+// It returns token usage statistics if the upstream stream includes usageMetadata.
+func handleGeminiStreamToAnthropic(reqID uint64, w http.ResponseWriter, body io.ReadCloser) *Usage {
 	defer body.Close()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 1024*64), 1024*1024)
@@ -1009,10 +1110,28 @@ func handleGeminiStreamToAnthropic(reqID uint64, w http.ResponseWriter, body io.
 		"content_type": "text",
 	})
 
+	var usage *Usage
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
+		}
+
+		// Attempt to capture usage metadata (if present)
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &raw); err == nil {
+			if um, ok := raw["usageMetadata"].(map[string]interface{}); ok {
+				if usage == nil {
+					usage = &Usage{}
+				}
+				if v, ok := um["promptTokenCount"].(float64); ok {
+					usage.InputTokens = int(v)
+				}
+				if v, ok := um["candidatesTokenCount"].(float64); ok {
+					usage.OutputTokens = int(v)
+				}
+			}
 		}
 		var chunk struct {
 			Candidates []struct {
@@ -1062,14 +1181,30 @@ func handleGeminiStreamToAnthropic(reqID uint64, w http.ResponseWriter, body io.
 					"stop_reason": stopReason,
 				},
 			})
-			writeSSE(w, "message_stop", map[string]interface{}{"type": "message_stop"})
-			return
+			// Emit message_stop with usage if available
+			stopEvent := map[string]interface{}{"type": "message_stop"}
+			if usage != nil && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+				stopEvent["usage"] = map[string]int{
+					"input_tokens":  usage.InputTokens,
+					"output_tokens": usage.OutputTokens,
+				}
+			}
+			writeSSE(w, "message_stop", stopEvent)
+			return usage
 		}
 	}
 
 	// stream ended without explicit finish
 	writeSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": 0})
-	writeSSE(w, "message_stop", map[string]interface{}{"type": "message_stop"})
+	stopEvent := map[string]interface{}{"type": "message_stop"}
+	if usage != nil && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+		stopEvent["usage"] = map[string]int{
+			"input_tokens":  usage.InputTokens,
+			"output_tokens": usage.OutputTokens,
+		}
+	}
+	writeSSE(w, "message_stop", stopEvent)
+	return usage
 }
 
 // logRequest prints path, model used, tools/messages counts.
