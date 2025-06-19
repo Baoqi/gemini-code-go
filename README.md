@@ -7,7 +7,7 @@
 1. **零外部框架**：仅依赖 Go 标准库 (`net/http`, `encoding/json` 等)。
 2. **环境变量配置**：
    * `GEMINI_API_KEY`  (必填) – Google AI Studio / Vertex AI 的 API Key。
-   * `BIG_MODEL`       (可选) – 默认为 `gemini-2.5-flash-preview-05-20`。
+   * `BIG_MODEL`       (可选) – 默认为 `gemini-2.5-flash`。
    * `SMALL_MODEL`     (可选) – 默认为 `gemini-2.0-flash`。
    * `PORT`            (可选) – 监听端口，默认 `8082`。
    * `GEMINI_BASE_URL` (可选) – Gemini REST Base URL，默认 `https://generativelanguage.googleapis.com/v1beta`。
@@ -29,10 +29,10 @@ cd gemini-code-go
 export GEMINI_API_KEY="<YOUR_API_KEY>"
 
 # 构建
-go build -o gemini-server
+go build -o gemini-code-go
 
 # 运行
-./gemini-server   # 默认 0.0.0.0:8082
+./gemini-code-go   # 默认 0.0.0.0:8082
 ```
 
 ## 对比 Python 版本
