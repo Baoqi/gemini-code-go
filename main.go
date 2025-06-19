@@ -51,6 +51,8 @@ func init() {
 	if geminiAPIKey == "" {
 		log.Println("[WARN] GEMINI_API_KEY not set – the server will start but upstream calls will fail.")
 	}
+	// initialize Langfuse if env vars present
+	initLangfuse()
 }
 
 // getEnv returns value from environment or fallback if empty.
@@ -432,14 +434,28 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	geminiModel := mapRequestedModel(req.Model)
 	logRequest(reqID, r.URL.Path, geminiModel, len(req.Tools), len(req.Messages))
 
+	// ---- Langfuse trace start ----
+	traceID := lfStartTrace("claude_proxy", map[string]interface{}{
+		"model":    req.Model,
+		"gemini":   geminiModel,
+		"messages": len(req.Messages),
+		"tools":    len(req.Tools),
+	})
+
 	gReq, err := convertToGemini(&req, geminiModel)
 	if err != nil {
+		lfFinishTrace(traceID, nil, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	upStart := time.Now()
+	generationID := lfStartGeneration(traceID, "gemini_generate", geminiModel, gReq)
+
 	resp, err := performGeminiRequestWithRetry(geminiModel, gReq, req.Stream)
 	if err != nil {
+		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{"error": err.Error()})
+		lfFinishTrace(traceID, nil, err)
 		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -451,9 +467,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		handleGeminiStreamToAnthropic(reqID, w, resp.Body)
+
+		// Finish generation after stream completes
+		latencyMs := time.Since(upStart).Milliseconds()
+		lfFinishGeneration(generationID, nil, nil, map[string]interface{}{
+			"status":     resp.StatusCode,
+			"latency_ms": latencyMs,
+			"model":      geminiModel,
+			"stream":     true,
+		})
+
 		log.Printf("[INFO][%d] Stream completed in %.2fs", reqID, time.Since(start).Seconds())
+		lfFinishTrace(traceID, "stream completed", nil)
 		return
 	}
+
+	// Finish generation for non-streaming requests
+	latencyMs := time.Since(upStart).Milliseconds()
 
 	// Non-streaming – parse upstream JSON and translate to Anthropic blocks
 	var upstream struct {
@@ -462,6 +492,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		} `json:"candidates"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&upstream); err != nil {
+		lfFinishTrace(traceID, nil, fmt.Errorf("decode upstream: %v", err))
 		http.Error(w, "failed to decode upstream", http.StatusBadGateway)
 		return
 	}
@@ -497,8 +528,29 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		Role:    "assistant",
 		Content: blocks,
 	}
+
+	// Update generation with final output
+	lfFinishGeneration(generationID, result.Content, nil, map[string]interface{}{
+		"status":         resp.StatusCode,
+		"latency_ms":     latencyMs,
+		"model":          geminiModel,
+		"response_id":    result.ID,
+		"content_blocks": len(blocks),
+	})
+
 	respondJSON(w, result)
 	log.Printf("[INFO][%d] Completed in %.2fs", reqID, time.Since(start).Seconds())
+
+	// Finish trace with simple text output for Langfuse dashboard
+	outputText := ""
+	if len(blocks) > 0 {
+		if firstBlock, ok := blocks[0].(map[string]interface{}); ok {
+			if text, exists := firstBlock["text"]; exists {
+				outputText = fmt.Sprintf("%v", text)
+			}
+		}
+	}
+	lfFinishTrace(traceID, outputText, nil)
 }
 
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
